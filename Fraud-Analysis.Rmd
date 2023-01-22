@@ -1,0 +1,175 @@
+---
+title: "Fraud-Analysis"
+author: "Alvaro Pena"
+date: "2023-01-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(ggplot2)
+library(xgboost)
+library(caret)
+library(Matrix)
+library(data.table)
+library(GGally)
+library(DiagrammeR)
+```
+
+# Read data
+
+```{r}
+# .csv file can be obtained from the link in the readme section
+data = read.csv2("data.csv", header = T, sep = ",")
+```
+
+Transforming type of data
+```{r}
+data$step = as.numeric(data$step)
+data$type = as.factor(data$type)
+data$amount = as.double(data$amount)
+data$oldbalanceOrg = as.double(data$oldbalanceOrg)
+data$newbalanceDest = as.double(data$newbalanceDest)
+data$oldbalanceDest = as.double(data$oldbalanceOrg)
+data$newbalanceOrig = as.double(data$newbalanceOrig)
+
+data$isFraud = as.logical(data$isFraud)
+data$isFlaggedFraud = as.logical(data$isFlaggedFraud)
+```
+
+```{r}
+summary(data)
+```
+```{r}
+count = data %>% select(type, isFraud) %>% filter(isFraud == T) 
+
+nrow(count)
+# We know now that frauds are comitted by taking out cash and tranfers
+count %>% group_by(type) %>% count()
+```
+
+Fraudulent transactions occur when taking cash out and transferring money. It will be interesting to show if the type of transaction has any effect when classifying the transactions.
+
+```{r}
+emptied_accounts = data %>% filter(newbalanceOrig == 0)
+
+summary(emptied_accounts)
+```
+
+```{r}
+data %>% select(amount, isFraud) %>%
+  ggplot(aes(x = log(amount))) +
+  geom_density() +
+  facet_wrap("isFraud") +
+  theme_bw()
+```
+Fraudulent transaction handle higher sums of money than real one.
+
+Stratified sampling using the caret package
+
+Training data
+```{r}
+partition = createDataPartition(data$isFraud, p = 0.7, list = F)
+
+training = data[partition, ] 
+
+training.data = training %>% select(-c(isFraud, step, nameOrig, nameDest, isFlaggedFraud))
+training.labels = training %>% select(isFraud) %>%
+  mutate(isFraud = as.numeric(isFraud)) %>% pull()
+```
+
+Testing data
+```{r}
+test = data[-partition, ]
+
+test.data = test %>% select(-c(isFraud, step, nameOrig, nameDest, isFlaggedFraud)) 
+test.labels = test %>% select(isFraud) %>% mutate(isFraud = as.numeric(isFraud))
+```
+
+Making sure the proportion of fraudulent transactions hold for both sets
+```{r}
+sum(training$isFraud)/ nrow(training) * 100
+sum(test$isFraud)/ nrow(test) * 100
+```
+
+We are creating sparse matrix for the xgboost model
+```{r}
+training_matrix = sparse.model.matrix(~.-1, training.data)
+
+test_matrix = sparse.model.matrix(~.-1, test.data)
+```
+
+Training the model
+```{r}
+bst = xgboost(data = training_matrix, label = training.labels, max.depth = 2,
+               eta = 1, nthread = 4, nrounds = 20,
+              objective = "binary:logistic", verbose =  2)
+```
+
+
+```{r}
+importance <- xgb.importance(feature_names = training_matrix@Dimnames[[2]], model = bst)
+head(importance)
+
+importanceRaw <- xgb.importance(feature_names = training_matrix@Dimnames[[2]], model = bst, data = training_matrix, label = training.labels)
+
+# Cleaning for better display
+importanceClean <- importanceRaw[,`:=`(Cover=NULL, Frequency=NULL)]
+
+head(importanceClean)
+
+xgb.plot.importance(importance_matrix = importanceRaw)
+
+```
+From our analysis the balance on the destination account and the balance of the origin account after the transaction are the most important
+features. Surprisingly the type of transaction is not a relevant feature.
+
+```{r}
+str(data)
+```
+
+```{r}
+pred = predict(bst, test_matrix)
+prediction = as.numeric(pred > 0.5)
+
+test$isFraudPred = prediction
+
+# This is the same as doing
+# error = mean(test$isFraudPred != as.numeric(test$isFraud)) * 100
+
+error = sum(test$isFraudPred != as.numeric(test$isFraud))/ nrow(test) * 100
+```
+Error is very small 0.04% of transactions are not classified as fraudulent. Out of 191 thousand transactions only 819 are classified as
+verified transactions.
+```{r}
+
+```
+
+
+```{r}
+test %>% filter(isFraudPred != isFraud) %>% select(amount, oldbalanceOrg, newbalanceOrig,
+                                                   newbalanceDest, newbalanceOrig) %>%
+  ggpairs()
+```
+
+```{r}
+sum(test %>% filter(isFraudPred != isFraud) %>% select(amount)) / 1000000
+```
+Amount of money that is lost due to transactions not handled correctly in Milliions
+
+
+```{r}
+summary(bst)
+```
+
+```{r}
+# xgb.dump(bst, with_stats = T)
+```
+
+Plot the first tree of the model
+```{r}
+xgb.plot.tree(model = bst, trees = 1, show_node_id = TRUE)
+```
+
